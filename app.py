@@ -59,7 +59,7 @@ def load_font():
     global FONT_DATA
     FONT_URL = "https://raw.githubusercontent.com/Thong-ihealth/arial-unicode/main/Arial-Unicode-Bold.ttf"
     try:
-        resp = requests.get(FONT_URL);
+        resp = requests.get(FONT_URL)
         resp.raise_for_status()
         FONT_DATA = resp.content
         logging.info("Custom font downloaded successfully")
@@ -69,9 +69,9 @@ def load_font():
 
 def load_badge():
     global BADGE_DATA
-    CELEB_URL = "https://i.ibb.co/YBrt0j0m/icon.png"
+    CELEBRITY_ICON_URL = "https://i.ibb.co/YBrt0j0m/icon.png"
     try:
-        resp = requests.get(CELEB_URL);
+        resp = requests.get(CELEBRITY_ICON_URL)
         resp.raise_for_status()
         BADGE_DATA = resp.content
         logging.info("Celebrity badge downloaded successfully")
@@ -81,15 +81,9 @@ def load_badge():
 
 def fetch_folder(folder_name):
     api_url = f"{GITHUB_API_BASE}/{folder_name}"
-    token = "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"  # Replace with your actual token
-
-    headers = {
-        'Accept': 'application/vnd.github.v3+json',
-        'Authorization': f'token {token}'
-    }
-
+    headers = {'Accept': 'application/vnd.github.v3+json'}
     try:
-        resp = requests.get(api_url, headers=headers, timeout=10)
+        resp = requests.get(api_url, headers=headers)
         resp.raise_for_status()
         items = resp.json()
         logging.info("Downloading %d assets from %s...", len(items), folder_name)
@@ -99,28 +93,26 @@ def fetch_folder(folder_name):
             if not name.lower().endswith(('.png', '.jpg')):
                 return None, None
             key = name.rsplit('.', 1)[0]
-            raw = item.get('download_url')
+            raw_url = item.get('download_url')
             try:
-                r = requests.get(raw, timeout=10)
-                r.raise_for_status()
-                img = Image.open(BytesIO(r.content)).convert('RGBA')
+                img_resp = requests.get(raw_url, timeout=10)
+                img_resp.raise_for_status()
+                img = Image.open(BytesIO(img_resp.content)).convert('RGBA')
                 return key, img
             except Exception as e:
-                logging.error("Error downloading %s: %s", raw, e)
+                logging.error("Error downloading %s: %s", raw_url, e)
                 return None, None
 
-        with ThreadPoolExecutor(max_workers=500) as executor:  # 500 is too high, use ~50
+        with ThreadPoolExecutor(max_workers=1000) as executor:
             futures = [executor.submit(download, it) for it in items]
             for fut in tqdm(as_completed(futures), total=len(futures), desc=folder_name):
-                k, img = fut.result()
-                if k and img:
-                    ASSET_CACHE[folder_name][k] = img
+                key, img = fut.result()
+                if key and img:
+                    ASSET_CACHE[folder_name][key] = img
 
         logging.info("Loaded %d assets for %s", len(ASSET_CACHE[folder_name]), folder_name)
-
     except Exception as e:
         logging.error("Error loading folder %s: %s", folder_name, e)
-
 
 def preload_assets():
     load_font()
@@ -352,6 +344,36 @@ def generate_image():
     final.save(buf,'PNG')
     buf.seek(0)
     return send_file(buf, mimetype='image/png')
+
+@app.route('/banner-download')
+def download_banners():
+    zbuf=BytesIO()
+    with ZipFile(zbuf,'w') as z:
+        for key,img in ASSET_CACHE['BANNERS'].items():
+            buf=BytesIO();img.save(buf,'PNG');buf.seek(0)
+            z.writestr(f"{key}.png",buf.read())
+    zbuf.seek(0)
+    return send_file(zbuf,attachment_filename='banners.zip',as_attachment=True)
+
+@app.route('/avatar-download')
+def download_avatars():
+    zbuf=BytesIO()
+    with ZipFile(zbuf,'w') as z:
+        for key,img in ASSET_CACHE['AVATARS'].items():
+            buf=BytesIO();img.save(buf,'PNG');buf.seek(0)
+            z.writestr(f"{key}.png",buf.read())
+    zbuf.seek(0)
+    return send_file(zbuf,attachment_filename='avatars.zip',as_attachment=True)
+
+@app.route('/pin-download')
+def download_pins():
+    zbuf=BytesIO()
+    with ZipFile(zbuf,'w') as z:
+        for key,img in ASSET_CACHE['PINS'].items():
+            buf=BytesIO();img.save(buf,'PNG');buf.seek(0)
+            z.writestr(f"{key}.png",buf.read())
+    zbuf.seek(0)
+    return send_file(zbuf,attachment_filename='pins.zip',as_attachment=True)
 
 # === Main ===
 if __name__ == '__main__':
