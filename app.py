@@ -1,4 +1,5 @@
 import logging
+import os
 import requests
 import asyncio
 import time
@@ -16,6 +17,8 @@ from google.protobuf import json_format, message
 from google.protobuf.message import Message
 from Crypto.Cipher import AES
 import base64
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === Settings ===
 MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
@@ -24,34 +27,105 @@ RELEASEVERSION = "OB48"
 USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 SUPPORTED_REGIONS = {"IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID", "TW", "VN", "TH", "ME", "PK", "CIS", "BD", "EUROPE"}
 
-# === Pre-downloaded assets ===
-FONT_URL             = "https://raw.githubusercontent.com/Thong-ihealth/arial-unicode/main/Arial-Unicode-Bold.ttf"
-CELEBRITY_ICON_URL   = "https://i.ibb.co/YBrt0j0m/icon.png"
-try:
-    # Download font
-    resp = requests.get(FONT_URL); resp.raise_for_status()
-    FONT_DATA = resp.content
-    logging.info("Custom font downloaded successfully")
-except Exception as e:
-    logging.error("Could not download custom font, will use default: %s", e)
-    FONT_DATA = None
+# === GitHub Repo Paths ===
+GITHUB_API_BASE = "https://api.github.com/repos/AdityaSharma2403/OUTFIT-S/contents"
+FOLDERS = {"BANNERS": "BANNERS", "AVATARS": "AVATARS", "PINS": "PINS"}
 
-try:
-    # Download celebrity badge once
-    resp = requests.get(CELEBRITY_ICON_URL); resp.raise_for_status()
-    BADGE_DATA = resp.content
-    logging.info("Celebrity badge downloaded successfully")
-except Exception as e:
-    logging.error("Could not download celebrity badge: %s", e)
-    BADGE_DATA = None
+# === Pre-loaded assets caches ===
+ASSET_CACHE = {"BANNERS": {}, "AVATARS": {}, "PINS": {}}
+BADGE_DATA = None
+FONT_DATA = None
 
-# === Flask App Setup ===
+# === Image Layout Constants ===
+SCALE = 4
+ACCOUNT_NAME_POSITION = {"x": 62,  "y": 0,  "font_size": 12.5}
+ACCOUNT_LEVEL_POSITION= {"x":180, "y":45, "font_size":12.5}
+GUILD_NAME_POSITION  = {"x": 62,  "y":40, "font_size":12.5}
+AVATAR_POSITION      = {"x": 0,   "y": 0,  "width":60, "height":60}
+PIN_POSITION         = {"x": 0,   "y":40, "width":20, "height":20}
+BADGE_POSITION       = {"x":40,  "y": 0,  "width":20, "height":20}
+FALLBACK_BANNER_ID   = "900000014"
+FALLBACK_AVATAR_ID   = "900000013"
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 CORS(app)
-logging.basicConfig(level=logging.DEBUG)
 cache = TTLCache(maxsize=100, ttl=300)
 cached_tokens = defaultdict(dict)
 
+# === Asset Preloading ===
+def load_font():
+    global FONT_DATA
+    FONT_URL = "https://raw.githubusercontent.com/Thong-ihealth/arial-unicode/main/Arial-Unicode-Bold.ttf"
+    try:
+        resp = requests.get(FONT_URL)
+        resp.raise_for_status()
+        FONT_DATA = resp.content
+        logging.info("Custom font downloaded successfully")
+    except Exception as e:
+        logging.error("Could not download custom font, will use default: %s", e)
+
+
+def load_badge():
+    global BADGE_DATA
+    CELEBRITY_ICON_URL = "https://i.ibb.co/YBrt0j0m/icon.png"
+    try:
+        resp = requests.get(CELEBRITY_ICON_URL)
+        resp.raise_for_status()
+        BADGE_DATA = resp.content
+        logging.info("Celebrity badge downloaded successfully")
+    except Exception as e:
+        logging.error("Could not download celebrity badge: %s", e)
+
+
+def fetch_folder(folder_name):
+    api_url = f"{GITHUB_API_BASE}/{folder_name}"
+    headers = {'Accept': 'application/vnd.github.v3+json'}
+    try:
+        resp = requests.get(api_url, headers=headers)
+        resp.raise_for_status()
+        items = resp.json()
+        logging.info("Downloading %d assets from %s...", len(items), folder_name)
+
+        def download(item):
+            name = item.get('name', '')
+            if not name.lower().endswith(('.png', '.jpg')):
+                return None, None
+            key = name.rsplit('.', 1)[0]
+            raw_url = item.get('download_url')
+            try:
+                img_resp = requests.get(raw_url, timeout=10)
+                img_resp.raise_for_status()
+                img = Image.open(BytesIO(img_resp.content)).convert('RGBA')
+                return key, img
+            except Exception as e:
+                logging.error("Error downloading %s: %s", raw_url, e)
+                return None, None
+
+        with ThreadPoolExecutor(max_workers=500) as executor:
+            futures = [executor.submit(download, it) for it in items]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=folder_name):
+                key, img = fut.result()
+                if key and img:
+                    ASSET_CACHE[folder_name][key] = img
+
+        logging.info("Loaded %d assets for %s", len(ASSET_CACHE[folder_name]), folder_name)
+    except Exception as e:
+        logging.error("Error loading folder %s: %s", folder_name, e)
+
+
+def preload_assets():
+    load_font()
+    load_badge()
+    for folder in FOLDERS.values():
+        fetch_folder(folder)
+
+# Ensure preload runs only once (avoid Flask reloader)
+if os.environ.get('WERKZEUG_RUN_MAIN') == 'true' or not os.environ.get('WERKZEUG_RUN_MAIN'):
+    preload_assets()
+
+# === Utility for fonts & assets ===
 def get_custom_font(size):
     if FONT_DATA:
         try:
@@ -60,34 +134,14 @@ def get_custom_font(size):
             logging.error("Error loading truetype from FONT_DATA: %s", e)
     return ImageFont.load_default()
 
-def fetch_image(url):
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        return Image.open(BytesIO(resp.content)).convert("RGBA")
-    except Exception as e:
-        logging.error("Image fetch error from %s: %s", url, e)
-        return None
 
-def get_banner_url(banner_id):
-    return f"https://raw.githubusercontent.com/AdityaSharma2403/OUTFIT-S/main/BANNERS/{banner_id}.png"
+def get_asset_image(folder, asset_id, fallback_id):
+    cache_map = ASSET_CACHE.get(folder, {})
+    img = cache_map.get(asset_id)
+    if img is None:
+        img = cache_map.get(fallback_id)
+    return img.copy() if img else None
 
-def get_avatar_url(avatar_id):
-    return f"https://raw.githubusercontent.com/AdityaSharma2403/OUTFIT-S/main/AVATARS/{avatar_id}.png"
-
-# Text positions & sizes
-ACCOUNT_NAME_POSITION   = {"x": 62,  "y": 0,  "font_size": 12.5}
-ACCOUNT_LEVEL_POSITION  = {"x": 180, "y": 45, "font_size": 12.5}
-GUILD_NAME_POSITION     = {"x": 62,  "y": 40, "font_size": 12.5}
-AVATAR_POSITION         = {"x": 0,   "y": 0,  "width": 60, "height": 60}
-PIN_POSITION            = {"x": 0,   "y": 40, "width": 20, "height": 20}
-BADGE_POSITION          = {"x": 40,  "y": 0,  "width": 20, "height": 20}
-
-SCALE = 4
-FALLBACK_BANNER_ID = "900000014"
-FALLBACK_AVATAR_ID = "900000013"
-
-# === Crypto & Protobuf Helpers ===
 def pad(text: bytes) -> bytes:
     padding_length = AES.block_size - (len(text) % AES.block_size)
     return text + bytes([padding_length] * padding_length)
@@ -105,7 +159,6 @@ async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
     json_format.ParseDict(json.loads(json_data), proto_message)
     return proto_message.SerializeToString()
 
-# === Account Credentials & Token Management ===
 def get_account_credentials(region: str) -> str:
     r = region.upper()
     if r == "IND":
@@ -114,6 +167,7 @@ def get_account_credentials(region: str) -> str:
         return "uid=3301387397&password=BAC03CCF677F8772473A09870B6228ADFBC1F503BF59C8D05746DE451AD67128"
     else:
         return "uid=3301239795&password=DD40EE772FCBD61409BB15033E3DE1B1C54EDA83B75DF0CDD24C34C7C8798475"
+
 
 async def get_access_token(account: str):
     url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
@@ -199,19 +253,26 @@ async def GetAccountInformation(uid, unk, region, endpoint):
             decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)
         ))
 
-# === Caching Decorator ===
-def cached_endpoint(ttl=300):
-    def decorator(fn):
-        @wraps(fn)
-        def wrapper(*a, **k):
-            key = (request.path, tuple(request.args.items()))
-            if key in cache:
-                return cache[key]
-            res = fn(*a, **k)
-            cache[key] = res
-            return res
-        return wrapper
-    return decorator
+def cached_endpoint(ttl=300):  
+    def decorator(fn):  
+        @wraps(fn)  
+        def wrapper(*a, **k):  
+            key = (request.path, tuple(request.args.items()))  
+            if key in cache:  
+                data = cache[key]  
+                return send_file(BytesIO(data), mimetype='image/png')  
+            result = fn(*a, **k)  
+            # fn returns Response or tuple(bytes, status)  
+            if isinstance(result, tuple) and isinstance(result[0], bytes):  
+                data, status = result  
+            elif isinstance(result, bytes):  
+                data, status = result, 200  
+            else:  
+                return result  
+            cache[key] = data  
+            return send_file(BytesIO(data), mimetype='image/png'), status  
+        return wrapper  
+    return decorator  
 
 @app.route('/refresh', methods=['GET','POST'])
 def refresh_tokens_endpoint():
@@ -221,83 +282,70 @@ def refresh_tokens_endpoint():
     except Exception as e:
         return jsonify({'error': f'Refresh failed: {e}'}),500
 
+# === Flask Route ===
 @app.route('/banner-image', methods=['GET'])
+@cached_endpoint(ttl=300)
 def generate_image():
     uid    = request.args.get('uid')
     region = request.args.get('region')
     if not uid or not region:
-        return jsonify({"error": "Missing uid or region"}), 400
-
+        return jsonify({"error":"Missing uid or region"}), 400
     try:
         data = asyncio.run(GetAccountInformation(uid, "7", region, "/GetPlayerPersonalShow"))
     except Exception as e:
         logging.error("Player info fetch error: %s", e)
-        return jsonify({"error": str(e)}), 500
-
+        return jsonify({"error":str(e)}), 500
     basic_info = data.get('basicInfo', {})
     guild_info = data.get('clanBasicInfo', {})
     if not basic_info:
-        return jsonify({"error": "No valid API response received"}), 500
-
-    banner_id = basic_info.get('bannerId') or FALLBACK_BANNER_ID
-    if banner_id == 'Default':
-        banner_id = FALLBACK_BANNER_ID
-    avatar_id = basic_info.get('headPic') or FALLBACK_AVATAR_ID
-    if avatar_id == 'Default':
-        avatar_id = FALLBACK_AVATAR_ID
-
-    account_name  = basic_info.get('nickname', '')
-    account_level = basic_info.get('level', '')
-    guild_name    = guild_info.get('clanName', '')
-
+        return jsonify({"error":"No valid API response received"}), 500
+    banner_id = str(basic_info.get('bannerId') or FALLBACK_BANNER_ID)
+    avatar_id = str(basic_info.get('headPic') or FALLBACK_AVATAR_ID)
+    account_name  = basic_info.get('nickname','')
+    account_level = basic_info.get('level','')
+    guild_name    = guild_info.get('clanName','')
     try:
         role_value = int(basic_info.get('role', 0))
-    except (ValueError, TypeError):
+    except:
         role_value = 0
     is_celebrity = role_value in (64, 68)
-
-    # Fetch and compose images
-    bg = fetch_image(get_banner_url(banner_id)) or fetch_image(get_banner_url(FALLBACK_BANNER_ID))
-    av = fetch_image(get_avatar_url(avatar_id)) or fetch_image(get_avatar_url(FALLBACK_AVATAR_ID))
+    bg = get_asset_image('BANNERS', banner_id, FALLBACK_BANNER_ID)
+    av = get_asset_image('AVATARS', avatar_id, FALLBACK_AVATAR_ID)
+    if not bg or not av:
+        return jsonify({"error":"Asset not found"}), 500
     bw, bh = bg.size
-    hr_bg = bg.resize((bw * SCALE, bh * SCALE), Image.LANCZOS)
+    hr_bg = bg.resize((bw*SCALE, bh*SCALE), Image.LANCZOS)
     aw, ah = av.size
-    new_h = bh * SCALE
-    new_w = int((aw / ah) * new_h)
+    new_h = bh*SCALE
+    new_w = int((aw/ah)*new_h)
     hr_av = av.resize((new_w, new_h), Image.LANCZOS)
     hr_bg.paste(hr_av, (AVATAR_POSITION['x']*SCALE, AVATAR_POSITION['y']*SCALE), hr_av)
-
     draw = ImageDraw.Draw(hr_bg)
-    fn = get_custom_font(ACCOUNT_NAME_POSITION['font_size'] * SCALE)
-    draw.text((ACCOUNT_NAME_POSITION['x']*SCALE, ACCOUNT_NAME_POSITION['y']*SCALE),
-              account_name, font=fn, fill='white')
-    fl = get_custom_font(ACCOUNT_LEVEL_POSITION['font_size'] * SCALE)
-    draw.text((ACCOUNT_LEVEL_POSITION['x']*SCALE, ACCOUNT_LEVEL_POSITION['y']*SCALE),
-              f"Lvl. {account_level}", font=fl, fill='white')
-    fg = get_custom_font(GUILD_NAME_POSITION['font_size'] * SCALE)
-    draw.text((GUILD_NAME_POSITION['x']*SCALE, GUILD_NAME_POSITION['y']*SCALE),
-              guild_name, font=fg, fill='white')
+    fn = get_custom_font(ACCOUNT_NAME_POSITION['font_size']*SCALE)
+    draw.text((ACCOUNT_NAME_POSITION['x']*SCALE, ACCOUNT_NAME_POSITION['y']*SCALE), account_name, font=fn, fill='white')
+    fl = get_custom_font(ACCOUNT_LEVEL_POSITION['font_size']*SCALE)
+    draw.text((ACCOUNT_LEVEL_POSITION['x']*SCALE, ACCOUNT_LEVEL_POSITION['y']*SCALE), f"Lvl. {account_level}", font=fl, fill='white')
+    fg = get_custom_font(GUILD_NAME_POSITION['font_size']*SCALE)
+    draw.text((GUILD_NAME_POSITION['x']*SCALE, GUILD_NAME_POSITION['y']*SCALE), guild_name, font=fg, fill='white')
 
-    pin_id = basic_info.get('pinId')
+    pin_id = str(basic_info.get('pinId',''))
     if pin_id:
-        pin_img = fetch_image(f"https://freefireinfo.vercel.app/icon?id={pin_id}")
+        pin_img = get_asset_image('PINS', pin_id, None)
         if pin_img:
-            pr = PIN_POSITION
-            hr_pin = pin_img.resize((pr['width']*SCALE, pr['height']*SCALE), Image.LANCZOS)
-            hr_bg.paste(hr_pin, (pr['x']*SCALE, pr['y']*SCALE), hr_pin)
+            hr_pin = pin_img.resize((PIN_POSITION['width']*SCALE, PIN_POSITION['height']*SCALE), Image.LANCZOS)
+            hr_bg.paste(hr_pin, (PIN_POSITION['x']*SCALE, PIN_POSITION['y']*SCALE), hr_pin)
 
-    # Paste celebrity badge from pre-downloaded data
     if is_celebrity and BADGE_DATA:
-        badge_img = Image.open(BytesIO(BADGE_DATA)).convert("RGBA")
-        bp = BADGE_POSITION
-        hr_badge = badge_img.resize((bp['width']*SCALE, bp['height']*SCALE), Image.LANCZOS)
-        hr_bg.paste(hr_badge, (bp['x']*SCALE, bp['y']*SCALE), hr_badge)
+        badge = Image.open(BytesIO(BADGE_DATA)).convert('RGBA')
+        hr_badge = badge.resize((BADGE_POSITION['width']*SCALE, BADGE_POSITION['height']*SCALE), Image.LANCZOS)
+        hr_bg.paste(hr_badge, (BADGE_POSITION['x']*SCALE, BADGE_POSITION['y']*SCALE), hr_badge)
 
     final = hr_bg.resize((bw, bh), Image.LANCZOS)
     buf = BytesIO()
-    final.save(buf, 'PNG')
+    final.save(buf,'PNG')
     buf.seek(0)
     return send_file(buf, mimetype='image/png')
 
+# === Main ===
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
