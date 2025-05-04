@@ -59,7 +59,7 @@ def load_font():
     global FONT_DATA
     FONT_URL = "https://raw.githubusercontent.com/Thong-ihealth/arial-unicode/main/Arial-Unicode-Bold.ttf"
     try:
-        resp = requests.get(FONT_URL)
+        resp = requests.get(FONT_URL);
         resp.raise_for_status()
         FONT_DATA = resp.content
         logging.info("Custom font downloaded successfully")
@@ -69,9 +69,9 @@ def load_font():
 
 def load_badge():
     global BADGE_DATA
-    CELEBRITY_ICON_URL = "https://i.ibb.co/YBrt0j0m/icon.png"
+    CELEB_URL = "https://i.ibb.co/YBrt0j0m/icon.png"
     try:
-        resp = requests.get(CELEBRITY_ICON_URL)
+        resp = requests.get(CELEB_URL);
         resp.raise_for_status()
         BADGE_DATA = resp.content
         logging.info("Celebrity badge downloaded successfully")
@@ -81,9 +81,15 @@ def load_badge():
 
 def fetch_folder(folder_name):
     api_url = f"{GITHUB_API_BASE}/{folder_name}"
-    headers = {'Accept': 'application/vnd.github.v3+json'}
+    token = "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"  # Replace with your actual token
+
+    headers = {
+        'Accept': 'application/vnd.github.v3+json',
+        'Authorization': f'token {token}'
+    }
+
     try:
-        resp = requests.get(api_url, headers=headers)
+        resp = requests.get(api_url, headers=headers, timeout=10)
         resp.raise_for_status()
         items = resp.json()
         logging.info("Downloading %d assets from %s...", len(items), folder_name)
@@ -93,24 +99,25 @@ def fetch_folder(folder_name):
             if not name.lower().endswith(('.png', '.jpg')):
                 return None, None
             key = name.rsplit('.', 1)[0]
-            raw_url = item.get('download_url')
+            raw = item.get('download_url')
             try:
-                img_resp = requests.get(raw_url, timeout=10)
-                img_resp.raise_for_status()
-                img = Image.open(BytesIO(img_resp.content)).convert('RGBA')
+                r = requests.get(raw, timeout=10)
+                r.raise_for_status()
+                img = Image.open(BytesIO(r.content)).convert('RGBA')
                 return key, img
             except Exception as e:
-                logging.error("Error downloading %s: %s", raw_url, e)
+                logging.error("Error downloading %s: %s", raw, e)
                 return None, None
 
-        with ThreadPoolExecutor(max_workers=500) as executor:
+        with ThreadPoolExecutor(max_workers=500) as executor:  # 500 is too high, use ~50
             futures = [executor.submit(download, it) for it in items]
             for fut in tqdm(as_completed(futures), total=len(futures), desc=folder_name):
-                key, img = fut.result()
-                if key and img:
-                    ASSET_CACHE[folder_name][key] = img
+                k, img = fut.result()
+                if k and img:
+                    ASSET_CACHE[folder_name][k] = img
 
         logging.info("Loaded %d assets for %s", len(ASSET_CACHE[folder_name]), folder_name)
+
     except Exception as e:
         logging.error("Error loading folder %s: %s", folder_name, e)
 
